@@ -32,6 +32,13 @@ cmd = [
     "--add-data", os.path.join(HERE, "AVI_logo28.png") + os.pathsep + ".",
     "--hidden-import", "websocket",
     "--hidden-import", "soundfile",
+    # soundfile 的 DLL 数据包：必须显式收集 __init__.py，否则运行时
+    # "import _soundfile_data" 失败 → cannot load libsndfile.dll (0x7e)
+    "--hidden-import", "_soundfile_data",
+    # PIL：浮窗 idle logo / 窗口图标渲染依赖，必须收集 Python 模块
+    # （仅 .pyd 二进制的旧打包会导致 from PIL import Image 失败 → 图标回退旧版）
+    "--hidden-import", "PIL.Image",
+    "--hidden-import", "PIL",
     "--hidden-import", "sounddevice",
     "--hidden-import", "pyperclip",
     "--hidden-import", "pynput",
