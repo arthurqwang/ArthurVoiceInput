@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
-"""把 voice_input.py 打包成单文件 exe（讯飞引擎版，无 faster-whisper）。
+"""把 voice_input.py 打包成 onedir 目录版 exe（讯飞引擎版，无 faster-whisper）。
 
 GitHub: https://github.com/arthurqwang/ArthurVoiceInput
 
 前置: pip install pyinstaller
 用法: python build_exe.py
-产物: dist/ArthurVoiceInput.exe  (--noconsole, 无黑窗, 单文件)
+产物: dist/ArthurVoiceInput/ArthurVoiceInput.exe  (--noconsole, 无黑窗, onedir 目录)
+
+为什么用 onedir 而不是 onefile：
+- onefile 每次启动都要把整个包（100MB+，900+ 文件）解压到 %TEMP%\\_MEIxxxx，
+  在本机低资源环境（C盘87%满、内存负载74%）下解压偶发失败/漏解压子目录，
+  表现为 _tcl_data\\auto.tcl 缺失、failed to start Python、图标回退等。
+- onedir 启动零解压，数据固定在同目录 _internal/ 中，彻底消除该类问题；
+  且整个目录拷到任何位置都能运行（绿色软件），日志/配置写 exe 所在目录。
 
 打包版行为差异:
 - 日志 voice_input.log / 配置 xfyun_config.ini / 语音速记 voice_notes/ 均落在 exe 所在目录
@@ -25,10 +32,12 @@ _AUTOSTART_NAME = "阿色语音快捷输入法"   # 与 voice_input.py 保持一
 cmd = [
     sys.executable, "-m", "PyInstaller",
     "--noconsole",
-    "--onefile",
+    "--onedir",
     "--name", EXE_NAME,
     "--icon", os.path.join(HERE, "AVI_logo.ico"),
-    # 浮窗 idle logo / 窗口图标：随 exe 打包（_MEIPASS 解压目录，resource_path 读取）
+    # 禁用 UPX 压缩：降低构建复杂度，onedir 下不影响运行
+    "--noupx",
+    # 浮窗 idle logo / 窗口图标：随 exe 打包（_internal 数据目录，resource_path 读取）
     "--add-data", os.path.join(HERE, "AVI_logo28.png") + os.pathsep + ".",
     "--hidden-import", "websocket",
     "--hidden-import", "soundfile",
@@ -53,7 +62,7 @@ def sync_autostart():
     """打包完成后同步开机自启动：若用户已启用（Run 键存在），
     更新为指向本次新生成的 exe，保证改名/重打包后自启动始终正确。"""
     import winreg
-    exe = os.path.join(HERE, "dist", EXE_NAME + ".exe")
+    exe = os.path.join(HERE, "dist", EXE_NAME, EXE_NAME + ".exe")
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as k:
