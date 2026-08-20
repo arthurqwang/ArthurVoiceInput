@@ -27,6 +27,9 @@ cmd = [
     "--noconsole",
     "--onefile",
     "--name", EXE_NAME,
+    "--icon", os.path.join(HERE, "AVI_logo.ico"),
+    # 浮窗 idle logo / 窗口图标：随 exe 打包（_MEIPASS 解压目录，resource_path 读取）
+    "--add-data", os.path.join(HERE, "AVI_logo28.png") + os.pathsep + ".",
     "--hidden-import", "websocket",
     "--hidden-import", "soundfile",
     "--hidden-import", "sounddevice",

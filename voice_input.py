@@ -49,6 +49,13 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def resource_path(name):
+    """只读资源文件路径：打包后从 PyInstaller 临时解压目录（sys._MEIPASS）读取，
+    开发时从脚本所在目录读取。用于浮窗 logo / 窗口图标等随 exe 打包的静态资源。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
 def setup_logging():
     logging.basicConfig(
         filename=os.path.join(app_dir(), "voice_input.log"),
@@ -451,7 +458,7 @@ MIC_DIM = (140, 47, 42)          # 深酒红（录音闪烁暗帧，与白帧交
 _ANIM_MS = 120                  # 录音动画帧间隔（波形跳动/话筒闪烁）
 _PRESS_MS = 350                 # 长按判定阈值：鼠标左键按住超过此时长（ms）才跟随定位
 _PRESS_MOVE_PX = 15             # 长按判定允许的鼠标位移（px）；超过视为拖选文本/拖动，不跟位
-APP_VERSION = "v0.0.1 (2026.8)"  # 产品版本号（配置/帮助对话框显示）
+APP_VERSION = "v0.0.1"  # 产品版本号（配置/帮助对话框显示）
 
 
 def _hex2rgb(h):
@@ -600,6 +607,110 @@ def _apply_layered(hwnd, color, alpha, size=_ICON_SIZE, mic_rgb=MIC_GRAY, wave=N
             user32.ReleaseDC(None, hdc_screen)
     except Exception as e:
         logger.error("_apply_layered 异常: %s", e)
+
+
+def _apply_logo_layered(hwnd, size, alpha, fallback_color):
+    """用 AVI_logo28.png 渲染浮窗（idle 态 logo）。
+
+    与 _apply_layered 走同一条 UpdateLayeredWindow 管道，但像素来自 PNG
+    （RGBA → BGRA 字节序），整体不透明度由 SourceConstantAlpha=alpha 控制
+    （平时 160 / hover 210，与旧红饼透明度语义一致）。
+    PNG 缺失或加载失败时回退到 _apply_layered 原绘制，绝不让浮窗空白。
+    """
+    try:
+        from PIL import Image
+        p = resource_path("AVI_logo28.png")
+        if not os.path.exists(p):
+            logger.warning("_apply_logo_layered: 缺少 %s，回退原绘制", p)
+            _apply_layered(hwnd, fallback_color, alpha, size, MIC_GRAY, None)
+            return
+        im = Image.open(p).convert("RGBA")
+        if im.size != (size, size):
+            im = im.resize((size, size), Image.LANCZOS)
+        arr = np.array(im)
+        h, w = arr.shape[:2]
+        # 预乘 alpha（关键！）：UpdateLayeredWindow 的混合公式为
+        #   输出 = 源RGB + (1-α)*背景色
+        # 若透明像素 RGB 残留非零色（本 logo 透明区 RGB=255,0,0 纯红），
+        # 黑色背景上会整片透出红色；预乘后 α=0 像素 RGB 归零，任何背景下都正确透明。
+        a16 = arr[..., 3].astype(np.uint16)
+        r_pm = (arr[..., 0].astype(np.uint16) * a16) >> 8
+        g_pm = (arr[..., 1].astype(np.uint16) * a16) >> 8
+        b_pm = (arr[..., 2].astype(np.uint16) * a16) >> 8
+        # RGBA(预乘) -> BGRA（UpdateLayeredWindow 要求 B,G,R,A 字节序）
+        px_src = np.empty((h, w, 4), dtype=np.uint8)
+        px_src[..., 0] = b_pm
+        px_src[..., 1] = g_pm
+        px_src[..., 2] = r_pm
+        px_src[..., 3] = arr[..., 3]
+
+        gdi32 = ctypes.windll.gdi32
+        user32.GetDC.argtypes = [wt.HWND]
+        user32.GetDC.restype = wt.HDC
+        user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        user32.ReleaseDC.restype = wt.INT
+        gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+        gdi32.CreateCompatibleDC.restype = wt.HDC
+        gdi32.CreateDIBSection.argtypes = [wt.HDC, ctypes.POINTER(BITMAPINFO), wt.UINT,
+                                           ctypes.POINTER(ctypes.c_void_p), wt.HANDLE, wt.DWORD]
+        gdi32.CreateDIBSection.restype = wt.HBITMAP
+        gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+        gdi32.SelectObject.restype = wt.HGDIOBJ
+        gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+        gdi32.DeleteObject.restype = wt.BOOL
+        gdi32.DeleteDC.argtypes = [wt.HDC]
+        gdi32.DeleteDC.restype = wt.BOOL
+
+        hdc_screen = user32.GetDC(None)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h          # 自顶向下
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = BI_RGB
+        buf = ctypes.c_void_p()
+        hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0,
+                                      ctypes.byref(buf), None, 0)
+        if not hbmp:
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(None, hdc_screen)
+            _apply_layered(hwnd, fallback_color, alpha, size, MIC_GRAY, None)
+            return
+        gdi32.SelectObject(hdc_mem, hbmp)
+        # 整块拷贝 BGRA 像素（w*h*4 字节）
+        ctypes.memmove(buf.value, px_src.ctypes.data, w * h * 4)
+        try:
+            user32.UpdateLayeredWindow.argtypes = [
+                wt.HWND, wt.HDC, ctypes.POINTER(POINT), ctypes.POINTER(SIZE),
+                wt.HDC, ctypes.POINTER(POINT), wt.COLORREF,
+                ctypes.POINTER(BLENDFUNCTION), wt.DWORD]
+            user32.UpdateLayeredWindow.restype = wt.BOOL
+            user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+            user32.GetWindowRect.restype = wt.BOOL
+            cur_x = cur_y = 0
+            rect = RECT()
+            if user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
+                cur_x, cur_y = rect.left, rect.top
+            dst = POINT(cur_x, cur_y)
+            sz = SIZE(size, size)
+            pt = POINT(0, 0)
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA)
+            user32.UpdateLayeredWindow(int(hwnd), hdc_screen,
+                                       ctypes.byref(dst), ctypes.byref(sz),
+                                       hdc_mem, ctypes.byref(pt), 0,
+                                       ctypes.byref(blend), ULW_ALPHA)
+        finally:
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(None, hdc_screen)
+    except Exception as e:
+        logger.error("_apply_logo_layered 异常: %s", e)
+        try:
+            _apply_layered(hwnd, fallback_color, alpha, size, MIC_GRAY, None)
+        except Exception:
+            pass
 
 
 def _enable_layered(hwnd):
@@ -1326,18 +1437,25 @@ class FloatingApp:
         self._press_t0 = 0.0           # 按下时刻（备用）
         self._config_win = None        # 配置对话框引用（防重复弹出）
         self._help_win = None          # 帮助窗口引用（防重复弹出）
+        self._win_icon_img = None      # 窗口图标 PhotoImage 引用（防 GC）
         self.root.after(300, self._follow_click)
         self._install_mouse_hook()
 
     def draw_circle(self, color, wave=None):
-        """重绘悬浮窗：高透明红色圆饼（有填充）+ 麦克风图标。
+        """重绘悬浮窗：idle 态显示 AVI_logo28.png（PNG 缩放渲染，RGBA 透明底）；
+        录音/提示态保留原红色圆饼+麦克风绘制（wave 为录音波形，None 不画）。
         透明度：平时 160、录音中 200（比原来更清晰）；hover 时再 +50。
         尺寸由 _set_hover_state 维护（28 平时 / 34 hover）；
-        话筒颜色：平时暖白米色，hover 纯白；wave 为录音波形（None 不画）。"""
+        话筒颜色：平时暖白米色，hover 纯白。"""
         hover = self._hover_visual
         base = _ALPHA_REC if color == self.rec_color else _ALPHA_IDLE
         alpha = min(255, base + (_ALPHA_HOVER_BOOST if hover else 0))
         mic = MIC_WHITE if hover else MIC_GRAY
+        if color == self.idle_color and wave is None:
+            # idle：显示 AVI_logo28.png（SourceConstantAlpha=alpha 控制整体不透明度，
+            # 与旧红饼透明度语义一致：平时 160 / hover 210）
+            _apply_logo_layered(self._hwnd, self._icon_size, alpha, self.idle_color)
+            return
         _apply_layered(self._hwnd, color, alpha, self._icon_size, mic, wave)
 
     def _set_hover_state(self, on):
@@ -1451,6 +1569,21 @@ class FloatingApp:
         except Exception as e:
             logger.debug("_fit_to_screen 异常: %s", e)
 
+    def _set_win_icon(self, win):
+        """给配置/帮助等 Toplevel 窗口设置左上角图标（AVI_logo28.png）。
+        iconphoto 使用 Tk 内置 PhotoImage（支持 PNG）；引用须保存在 self 上防 GC。"""
+        try:
+            icon_path = resource_path("AVI_logo28.png")
+            if not os.path.exists(icon_path):
+                logger.debug("窗口图标缺失，跳过: %s", icon_path)
+                return
+            img = tk.PhotoImage(file=icon_path)
+            self._win_icon_img = img          # 防 GC（Tk 引用必须存活）
+            win.iconphoto(True, img)
+            logger.debug("窗口图标已设置: %s", icon_path)
+        except Exception as e:
+            logger.debug("设置窗口图标失败: %s", e)
+
     def _open_config(self):
         """菜单-配置：弹出配置对话框，编辑讯飞三个凭证参数并保存到 xfyun_config.ini。"""
         try:
@@ -1486,6 +1619,7 @@ class FloatingApp:
         win.title(TITLE)
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        self._set_win_icon(win)
 
         def close():
             self._config_win = None
@@ -1614,6 +1748,7 @@ class FloatingApp:
         win.title(TITLE)
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        self._set_win_icon(win)
 
         def close():
             self._help_win = None

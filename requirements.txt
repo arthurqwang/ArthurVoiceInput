@@ -3,5 +3,7 @@ soundfile
 pynput
 pyperclip
 numpy
+# 图标渲染（浮窗 idle logo / 窗口图标 / exe 图标生成）
+pillow
 # 讯飞开放平台引擎（语音识别后端）
 websocket-client
