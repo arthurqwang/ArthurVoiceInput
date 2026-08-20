@@ -1,0 +1,7 @@
+sounddevice
+soundfile
+pynput
+pyperclip
+numpy
+# 讯飞开放平台引擎（语音识别后端）
+websocket-client
