@@ -2,7 +2,7 @@
 
 Windows 屏幕常驻语音输入法：**按住鼠标说话，松开即识别并输出到光标处**。
 
-微小透明按钮自动跟随输入光标，在保持与讯飞输入法同等准确性的前提下，**解决讯飞输入法自带的大块悬浮窗口遮盖文字的问题**。使用起来非常方便迅捷。
+长按鼠标左键呼出输入按钮，在保持与讯飞输入法同等准确性的前提下，**解决讯飞输入法自带的大块悬浮窗口遮盖文字的问题**。使用起来非常方便迅捷。
 
 基于讯飞开放平台「语音听写 iat」引擎，识别结果通过模拟键盘/剪贴板注入到任意应用——记事本、浏览器、聊天窗口、办公软件均可使用。打包为单文件 exe，无需安装 Python 环境即可运行。
 
@@ -20,7 +20,7 @@ Windows 屏幕常驻语音输入法：**按住鼠标说话，松开即识别并�
 | 🎙️ 讯飞 iat 引擎 | 16kHz 音频 WebSocket 实时听写，中文识别稳定 |
 | ⌨️ 三种注入模式 | `clipboard`（Ctrl+V 粘贴，默认）/ `type`（底层键盘模拟）/ `kb`（语音速记到 markdown 文件） |
 | 🔑 全局热键 | `Ctrl+Alt+Space` 按住也可录音 |
-| 🚀 单文件 exe | PyInstaller 打包，脱离 Python 环境独立运行（约 26MB） |
+| 🚀 单文件 exe | PyInstaller 打包，脱离 Python 环境独立运行（约 33MB） |
 | 🔄 智能重启 | 右键菜单「重启」一键重启，配置改动即时生效 |
 | 🌅 开机自启 | 配置窗口勾选即写注册表；exe 每次启动自检自愈（改名/移动后自动修正） |
 | 📡 代理友好 | 自动读取 `HTTPS_PROXY` / `HTTP_PROXY` 走代理（适配内网） |
@@ -92,12 +92,14 @@ python build_exe.py        # 产物：dist/ArthurVoiceInput.exe
 ## 📁 项目结构
 
 ```
-voice-input/
+ArthurVoiceInput/
 ├── voice_input.py      # 主程序：浮窗 UI / 录音 / 注入 / 菜单 / 自启动
 ├── xfyun_asr.py        # 讯飞 iat WebSocket 引擎（鉴权 / 代理 / 重试）
 ├── build_exe.py        # PyInstaller 打包脚本
 ├── requirements.txt    # Python 依赖
 ├── run_xfyun.bat       # 一键启动脚本（读 xfyun_config.ini 凭证）
+├── AVI_logo28.png      # 浮窗 idle 图标 / 窗口图标
+├── AVI_logo.ico        # exe 图标（由 AVI_logo.png 生成）
 └── dist/               # 打包产物（ArthurVoiceInput.exe）
 ```
 
