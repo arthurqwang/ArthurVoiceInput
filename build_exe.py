@@ -33,6 +33,7 @@ cmd = [
     sys.executable, "-m", "PyInstaller",
     "--noconsole",
     "--onedir",
+    "--noconfirm",
     "--name", EXE_NAME,
     "--icon", os.path.join(HERE, "AVI_logo.ico"),
     # 禁用 UPX 压缩：降低构建复杂度，onedir 下不影响运行
@@ -54,6 +55,12 @@ cmd = [
     "--hidden-import", "pynput.keyboard",
     "--hidden-import", "pynput.mouse",
     "--hidden-import", "tkinter.messagebox",
+    # UI Automation 文本注入：comtypes 在运行时生成 UIAutomationCore 的 typelib 包装，
+    # 需把 comtypes 相关模块全部收集；lazy import 保证缺包时仅注入失败而不影响启动。
+    "--hidden-import", "comtypes",
+    "--hidden-import", "comtypes.client",
+    "--hidden-import", "comtypes.typeinfo",
+    "--hidden-import", "comtypes.gen",
     os.path.join(HERE, "voice_input.py"),
 ]
 
