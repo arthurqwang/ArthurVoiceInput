@@ -26,6 +26,27 @@ import os
 import re
 import sys
 import time
+
+# ---- 冻结包 Tcl/Tk 路径兜底（必须在任何 import tkinter 之前执行）----
+# PyInstaller 6.x 的 pyi_rth__tkinter 钩子把 TCL_LIBRARY 指向
+# `sys._MEIPASS/_tcl_data`，但实际数据在 onedir/onefile 中均位于
+# `_internal/_tcl_data/` 子目录，导致钩子找不到、Tcl 退回到系统 Tcl；
+# 系统 Tcl 与打包 Tk 版本不一致时即报 "Can't find a usable init.tcl"。
+# 这里的兜底遍历 _tcl_data 可能位置，确保 TCL_LIBRARY/TK_LIBRARY 指向真实数据。
+if getattr(sys, "frozen", False):
+    _base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(sys.executable))
+    for _sub in ("_internal/_tcl_data", "_tcl_data"):
+        _p = os.path.join(_base, _sub)
+        if os.path.isfile(os.path.join(_p, "init.tcl")):
+            os.environ["TCL_LIBRARY"] = _p
+            break
+    for _sub in ("_internal/_tk_data", "_tk_data"):
+        _p = os.path.join(_base, _sub)
+        if os.path.isfile(os.path.join(_p, "tk.tcl")):
+            os.environ["TK_LIBRARY"] = _p
+            break
+    del _sub, _p, _base
+# --------------------------------------------------------------------
 import math
 import wave
 import tempfile
@@ -1205,6 +1226,255 @@ def _inject_paste(text, target_hwnd):
         return False
 
 
+# ---------- UI Automation 文本注入（根治方案） ----------
+# 通过 UI Automation 的 TextPattern.InsertText 把文本插入到「任意支持 UIA 的编辑控件」
+# （Word / WPS / Electron / Chrome / Edge / 浏览器地址栏 / 各类聊天输入框 / 富文本编辑器等），
+# 不再依赖 SendInput / 剪贴板 / WM_PASTE —— 这些方式在「目标进程未提权(UIPI 拦截)」或
+# 「现代文本控件不响应原始键盘/字符消息」时会被静默丢弃，导致「只在记事本落字」的 bug。
+#
+# 设计要点：
+#   * 优先走 UIA；不支持 TextPattern 的控件（如经典 EDIT=记事本）本函数返回 False，
+#     由调用方自动回退到原有 SendInput / 剪贴板 / WM_PASTE 链路（记事本等仍可用）。
+#   * 通过 ElementFromHandle(target_hwnd) 取元素，再在自身/后代/祖先中查找 TextPattern
+#     控件，完全不依赖「前台焦点」，因此对后台/最小化窗口也稳。
+#   * InsertText 的 vtable 槽位在运行时从 typelib 推导（标准 Windows 自带），不写死；
+#     主路径用 comtypes 高层调用，失败时退回推导槽位做原生 vtable 调用。
+#   * COM 在每个调用线程内自行 STA 初始化，避免跨线程 COM 套间问题。
+
+_UIMOD = None          # comtypes 生成的 UIAutomationCore 模块（缓存）
+_UITEXT_IDX = None     # InsertText 的 vtable 槽位（运行时推导，缓存：int 可用 / False 不可用）
+
+
+def _uia_get_module():
+    global _UIMOD
+    if _UIMOD is None:
+        import comtypes.client
+        # 与 uiautomation 库一致的可用实例化方式（本机/标准机均可用）
+        _UIMOD = comtypes.client.GetModule("UIAutomationCore.dll")
+    return _UIMOD
+
+
+def _uia_inserttext_vtable_index():
+    """从 typelib 推导 IUIAutomationTextRange.InsertText 的真实 vtable 槽位。
+
+    标准 Windows 的 typelib 含 InsertText；本机精简版可能缺失，此时回退到
+    微软标准固定布局 oVft=168（槽位 21，紧随 GetChildren(160) 之后）。"""
+    global _UITEXT_IDX
+    if _UITEXT_IDX is not None:
+        return _UITEXT_IDX
+    try:
+        import comtypes.typeinfo as ti
+        tlb = ti.LoadTypeLib(r"C:\Windows\System32\UIAutomationCore.dll")
+        for i in range(tlb.GetTypeInfoCount()):
+            info = tlb.GetTypeInfo(i)
+            if info.GetDocumentation(-1)[0] != "IUIAutomationTextRange":
+                continue
+            tdesc = info.GetTypeAttr()
+            for j in range(tdesc.cFuncs):
+                fd = info.GetFuncDesc(j)
+                if info.GetDocumentation(fd.memid)[0] == "InsertText":
+                    _UITEXT_IDX = fd.oVft // 8
+                    logger.debug("UIA InsertText vtable 槽位=%s", _UITEXT_IDX)
+                    return _UITEXT_IDX
+    except Exception as e:
+        logger.debug("推导 InsertText vtable 槽位失败（本机 typelib 可能精简）: %s", e)
+    # 精简 typelib 兜底：标准 Windows 的 IUIAutomationTextRange.InsertText 固定位于
+    # oVft=168（槽位 21），紧随 GetChildren(160) 之后。精简系统镜像的 typelib 不描述
+    # 该方法，但运行时接口 vtable 布局仍是微软标准顺序，因此固定槽位依然有效。
+    _UITEXT_IDX = 21
+    logger.debug("UIA InsertText 使用标准固定槽位=21 (oVft=168, 精简 typelib 兜底)")
+    return _UITEXT_IDX
+
+
+def _uia_pattern_of(element):
+    """若 element 支持 TextPattern(10014) 则返回 IUIAutomationTextPattern COM 指针，否则 None。"""
+    mod = _uia_get_module()
+    try:
+        p = element.GetCurrentPattern(10014)
+        if p:
+            return p.QueryInterface(mod.IUIAutomationTextPattern)
+    except Exception:
+        pass
+    return None
+
+
+def _uia_find_text_pattern(automation, element):
+    """在 element 自身 / 后代 / 祖先中查找支持 TextPattern 的控件，返回
+    IUIAutomationTextPattern COM 指针；找不到返回 None。"""
+    pat = _uia_pattern_of(element)
+    if pat:
+        return pat
+    # 后代（RawViewWalker 深度优先，带访问去重与上限，防环）
+    try:
+        import ctypes
+        walker = automation.RawViewWalker
+        visited = set()
+        stack = [element]
+        guard = 0
+        while stack and guard < 4000:
+            guard += 1
+            cur = stack.pop()
+            try:
+                key = ctypes.cast(cur, ctypes.c_void_p).value
+                if key in visited:
+                    continue
+                visited.add(key)
+            except Exception:
+                pass
+            pat = _uia_pattern_of(cur)
+            if pat:
+                return pat
+            try:
+                child = walker.GetFirstChildElement(cur)
+                sib = child
+                while sib:
+                    stack.append(sib)
+                    sib = walker.GetNextSiblingElement(sib)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("UIA 后代遍历异常: %s", e)
+    # 祖先
+    try:
+        parent = element.GetParentElement()
+        depth = 0
+        while parent and depth < 16:
+            pat = _uia_pattern_of(parent)
+            if pat:
+                return pat
+            parent = parent.GetParentElement()
+            depth += 1
+    except Exception:
+        pass
+    return None
+
+
+def _uia_insert_range(text_pattern):
+    """返回用于插入的 TextRange：优先光标处（GetCaretRange / GetSelection 退化 range），
+    失败退回 DocumentRange（文档开头，兜底）。"""
+    # 1) GetCaretRange（较新 typelib 位于 IUIAutomationTextPattern）
+    try:
+        res = text_pattern.GetCaretRange()
+        rng = res[1] if isinstance(res, tuple) else res
+        if rng:
+            return rng
+    except Exception:
+        pass
+    # 2) GetSelection：光标（无选区时退化为光标处的退化 range）即插入点
+    try:
+        arr = text_pattern.GetSelection()
+        if arr and getattr(arr, "Length", 0) and arr.Length > 0:
+            return arr.GetElement(0)
+    except Exception:
+        pass
+    # 3) DocumentRange 兜底
+    try:
+        return text_pattern.DocumentRange
+    except Exception:
+        return None
+
+
+def _uia_do_insert(range_ptr, text):
+    """调用 IUIAutomationTextRange.InsertText(text)。优先 comtypes 高层；
+    若本机 typelib 未暴露 InsertText 方法，退回运行时推导的 vtable 槽位做原生调用。"""
+    # 1) comtypes 高层（标准 Windows 可用）
+    try:
+        range_ptr.InsertText(text)
+        return True
+    except AttributeError:
+        pass  # 本机 typelib 未生成 InsertText 方法，走 vtable 兜底
+    # 2) 运行时推导的 vtable 槽位
+    import ctypes
+    idx = _uia_inserttext_vtable_index()
+    if not idx:
+        return False
+    try:
+        VTBL = ctypes.POINTER(ctypes.c_void_p)
+        pp = ctypes.cast(range_ptr, VTBL)
+        vtable = ctypes.cast(pp[0], VTBL)
+        this = ctypes.cast(range_ptr, ctypes.c_void_p).value
+        fn = ctypes.cast(vtable[idx], ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, ctypes.c_void_p))
+        oleaut32 = ctypes.windll.oleaut32
+        oleaut32.SysAllocString.argtypes = [ctypes.c_wchar_p]
+        oleaut32.SysAllocString.restype = ctypes.c_void_p
+        bstr = oleaut32.SysAllocString(text)
+        hr = fn(this, ctypes.c_void_p(bstr))
+        return (hr & 0xFFFFFFFF) == 0
+    except Exception as e:
+        logger.debug("UIA 原生 vtable InsertText 失败: %s", e)
+        return False
+
+
+def _inject_uia(text, target_hwnd):
+    """UI Automation 文本注入（根治方案）。
+    返回 True 表示已成功注入；返回 False 表示目标不支持 TextPattern / UIA 不可用，
+    调用方应回退到原有 SendInput / 剪贴板 / WM_PASTE 链路。"""
+    if not text:
+        return False
+    try:
+        import comtypes.client
+        mod = _uia_get_module()
+        automation = comtypes.client.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+            interface=mod.IUIAutomation,
+        )
+
+        # 注入前先把浮窗藏起来，避免抢占焦点（与 _inject_paste 一致）
+        try:
+            try:
+                _app = app
+            except NameError:
+                _app = None
+            if _app and getattr(_app, "_visible", False):
+                _app.root.after(0, _app.root.withdraw)
+                time.sleep(0.05)
+        except Exception:
+            pass
+
+        # 取目标元素：优先 ElementFromHandle(target_hwnd)（不依赖前台焦点）
+        element = None
+        if target_hwnd:
+            try:
+                element = automation.ElementFromHandle(int(target_hwnd))
+            except Exception as e:
+                logger.debug("ElementFromHandle 失败: %s", e)
+        if not element:
+            try:
+                element = automation.GetFocusedElement()
+            except Exception as e:
+                logger.debug("GetFocusedElement 失败: %s", e)
+        if not element:
+            logger.info("_inject_uia: 未取得目标元素，回退原有链路")
+            return False
+
+        text_pattern = _uia_find_text_pattern(automation, element)
+        if not text_pattern:
+            logger.info("_inject_uia: 目标不支持 TextPattern，回退原有链路")
+            return False
+
+        rng = _uia_insert_range(text_pattern)
+        if not rng:
+            logger.info("_inject_uia: 未取得插入 Range，回退原有链路")
+            return False
+
+        ok = _uia_do_insert(rng, text)
+        if ok:
+            logger.info("_inject_uia: UIA 注入成功（%d 字）", len(text))
+            # 注入后尽量把目标窗口提到前台，方便用户继续输入
+            try:
+                if target_hwnd:
+                    restore_focus(target_hwnd)
+            except Exception:
+                pass
+        else:
+            logger.warning("_inject_uia: UIA 注入调用失败，回退原有链路")
+        return ok
+    except Exception as e:
+        logger.exception("_inject_uia 异常: %s", e)
+        return False
+
+
 def inject_text(text, mode="type", target_hwnd=None):
     if not text:
         return
@@ -1213,6 +1483,14 @@ def inject_text(text, mode="type", target_hwnd=None):
     if mode == "kb":
         # 语音速记：先落盘当日速记，再照常填入光标
         append_to_kb(text, os.environ.get("VI_KB_DIR"))
+    # 【根治方案】优先尝试 UIA TextPattern 注入：对 Word / WPS / Electron / 浏览器 /
+    # 聊天输入框等现代控件最稳（不依赖 SendInput / 剪贴板 / 前台焦点）。
+    # 不支持 TextPattern 的控件（如经典 EDIT=记事本）或 UIA 不可用时返回 False，
+    # 自动回退到下方原有 SendInput / 剪贴板 / WM_PASTE 链路。
+    if _inject_uia(text, target_hwnd):
+        logger.info("inject_text: UIA 注入成功，结束（已跳过原有链路）")
+        return
+    logger.info("inject_text: UIA 不可用/失败，回退原有注入链路")
     if mode == "clipboard":
         # 注入流程调度到 tkinter 主线程执行（restore_focus 在主线程调用
         # SetForegroundWindow 更可靠，且 SendInput 必须由前台线程发出才被系统接受）。
