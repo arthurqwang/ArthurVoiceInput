@@ -7,3 +7,5 @@ numpy
 pillow
 # 讯飞开放平台引擎（语音识别后端）
 websocket-client
+# UI Automation 文本注入（根治「只在记事本落字」：对 Word/Electron/浏览器等现代控件插入文本）
+comtypes==1.4.16
