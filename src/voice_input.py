@@ -1042,6 +1042,65 @@ class INPUT(ctypes.Structure):
     _anonymous_ = ("_u",)
 
 
+def _process_integrity_level():
+    """返回当前进程完整性级别字符串（Medium/High/Low/...），用于诊断 UIPI 拦截。"""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+        TOKEN_QUERY = 0x0008
+        TokenIntegrityLevel = 25
+        tok = ctypes.c_void_p()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
+                                         ctypes.byref(tok)):
+            return "?"
+        try:
+            size = ctypes.c_ulong(0)
+            advapi32.GetTokenInformation(tok, TokenIntegrityLevel, None, 0, ctypes.byref(size))
+            buf = ctypes.create_string_buffer(max(1, size.value))
+            if not advapi32.GetTokenInformation(tok, TokenIntegrityLevel, buf, size.value,
+                                                ctypes.byref(size)):
+                return "?"
+            # TOKEN_MANDATORY_LABEL: { SID_AND_ATTRIBUTES Label; } → Label.Sid 指针在结构开头
+            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            if not sid_ptr:
+                return "?"
+            sid = ctypes.cast(sid_ptr, ctypes.POINTER(ctypes.c_ubyte))
+            count = sid[1]  # SubAuthorityCount
+            if count < 1:
+                return "?"
+            # SID 布局: Revision(1) Count(1) Authority(6) → SubAuthorities 从偏移 8 起
+            sub = ctypes.cast(ctypes.byref(sid, 8), ctypes.POINTER(ctypes.c_ulong))
+            level = sub[count - 1]
+            names = {16: "Untrusted", 32: "Low", 12288: "Medium", 16384: "High", 20480: "System"}
+            return names.get(level, "L%d" % level)
+        finally:
+            kernel32.CloseHandle(tok)
+    except Exception:
+        return "?"
+
+
+def _log_inject_diag(target_hwnd=None):
+    """SendInput 全失败时的环境诊断：目标/前台窗口归属 + 本进程完整性级别，
+    用于判断 UIPI/权限拦截。"""
+    try:
+        cur = int(user32.GetForegroundWindow() or 0)
+        tgt = int(target_hwnd) if target_hwnd else 0
+        for label, hwnd in (("target", tgt), ("foreground", cur)):
+            if not hwnd:
+                logger.info("inject_diag: %s hwnd=0", label)
+                continue
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            logger.info("inject_diag: %s hwnd=%s class=%r pid=%s",
+                        label, hwnd, cls.value, pid.value)
+        logger.info("inject_diag: 本进程完整性=%s (SendInput 0 事件)",
+                    _process_integrity_level())
+    except Exception as e:
+        logger.debug("inject_diag 异常: %s", e)
+
+
 def _char_input(ch, keyup=False):
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
@@ -1092,16 +1151,74 @@ def type_unicode(text, target_hwnd=None):
     ok = sent == len(inputs)
     logger.info("type_unicode: SendInput 发送 %d 个事件，成功 %d 个，GetLastError=%s",
                 len(inputs), sent, err)
+    if not ok:
+        # 诊断：SendInput 全失败时的环境信息（前台窗口归属 + 完整性级别）
+        _log_inject_diag(target_hwnd)
     return ok
+
+
+def type_unicode_keybd(text, target_hwnd=None):
+    """keybd_event 逐字符 Unicode 注入（SendInput 被系统拦截时的备选路径）。
+
+    keybd_event 是旧版键盘 API，部分受限环境（SendInput 返回 0 且 LastError=0，
+    如安全软件/输入法钩子拦截）下 SendInput 无效而 keybd_event 仍然有效。"""
+    if not text:
+        return False
+    try:
+        if target_hwnd:
+            try:
+                user32.SetForegroundWindow(int(target_hwnd))
+            except Exception:
+                pass
+            time.sleep(0.15)
+        user32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte,
+                                       ctypes.c_ulong, ctypes.c_ulong]
+        KEYEVENTF_KEYUP = 0x0002
+        KEYEVENTF_UNICODE = 0x0004
+        for ch in text:
+            sc = ord(ch) & 0xFFFF
+            user32.keybd_event(0, sc, KEYEVENTF_UNICODE, 0)
+            user32.keybd_event(0, sc, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+            time.sleep(0.012)
+        logger.info("type_unicode_keybd: keybd_event 注入 %d 字符", len(text))
+        return True
+    except Exception as e:
+        logger.error("type_unicode_keybd 异常: %s", e)
+        return False
 
 
 WM_CHAR = 0x0102
 WM_PASTE = 0x0302
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+
+
+def _get_window_text(hwnd):
+    """通过 WM_GETTEXT 读回窗口/控件当前文本（仅对经典控件有效，如记事本 EDIT、
+    单行输入框等）。现代控件（Word 文档区 / 浏览器地址栏等）不支持时返回 None。
+    ⚠️ 空文本必须返回 ""（而不是 None）：否则 post_text 读回验证会把「空框 +
+    WM_CHAR 已注入成功」误判为「无法读回」而继续走 WM_PASTE，造成重复注入。"""
+    try:
+        hwnd = int(hwnd)
+        if not hwnd:
+            return None
+        length = user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+        if length < 0:
+            return None
+        buf = ctypes.create_unicode_buffer(int(length) + 2)
+        user32.SendMessageW(hwnd, WM_GETTEXT, len(buf), buf)
+        return buf.value
+    except Exception:
+        return None
 
 
 def post_text(hwnd, text):
-    """通过 PostMessage(WM_CHAR) 把文本直接投递到目标窗口的插入点，
-    不依赖争夺前台焦点（对 Electron/浏览器/记事本均有效）。失败返回 False。"""
+    """【已退役，不再被注入链调用】通过 PostMessage(WM_CHAR) 投递文本。
+
+    退役原因：WM_CHAR 对「有光标控件但读回不可靠」的现代控件（Excel 单元格 /
+    Electron 输入框）会「已生效却误判失败」，随后 WM_PASTE 再注入一次 →
+    同一文本出现两份（用户实测重复落字）。经典控件由 SendInput / WM_PASTE 覆盖，
+    此函数保留仅供调试/诊断参考。失败返回 False。"""
     if not hwnd:
         return False
     try:
@@ -1111,29 +1228,51 @@ def post_text(hwnd, text):
         info = GUITHREADINFO()
         info.cbSize = ctypes.sizeof(GUITHREADINFO)
         tgt = hwnd
+        has_caret = False
         if user32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndCaret:
             tgt = int(info.hwndCaret)
+            has_caret = True
+        if not has_caret:
+            # ⚠️ 无光标控件(hwndCaret=0)：WM_CHAR 只能投到顶层窗口。现代控件
+            # （Electron/Excel 等）可能把顶层 WM_CHAR 当作输入处理（落字但无法
+            # 读回验证），也可能丢弃——两者都不可验证。若「已生效却继续走
+            # WM_PASTE」，同一文本会被粘贴两次（用户实测：电子表格/输入框
+            # 重复落字）。因此无可靠光标控件时直接放弃 WM_CHAR 路径，
+            # 交由剪贴板/WM_PASTE 单次注入。
+            logger.info("post_text: 无光标控件(hwndCaret=0)，跳过 WM_CHAR 避免重复落字")
+            return False
         # 让目标窗口处于活动态，Electron 渲染进程才会处理投递的字符
         # ⚠️ 不要无条件 ShowWindow(SW_RESTORE)：会把最大化窗口还原变小，仅最小化时恢复
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
+        before = _get_window_text(tgt)
         ok_all = True
         for ch in text:
             r = user32.PostMessageW(tgt, WM_CHAR, ord(ch), 0)
             if not r:
                 ok_all = False
             time.sleep(0.008)
-        logger.info("post_text: 已向 hwnd=%s 投递 %d 字符，结果=%s", tgt, len(text), ok_all)
-        return ok_all
+        time.sleep(0.05)
+        after = _get_window_text(tgt)
+        if before is not None and after is not None:
+            # 经典控件可读回：必须确认文字真的落入（内容变化且包含注入文本）
+            landed = (after != before) and (text in after)
+            logger.info("post_text: 已投递 %d 字符 读回验证 before=%r after=%r landed=%s",
+                        len(text), before[-40:], after[-40:], landed)
+            return landed
+        # 现代控件读不回文本：不轻易判定成功，交回调用方走剪贴板/其他兜底
+        logger.info("post_text: 目标控件无法读回文本（现代控件），保守返回 False 交兜底")
+        return False
     except Exception as e:
         logger.error("post_text 异常: %s", e)
         return False
 
 
 def _inject_paste(text, target_hwnd):
-    """剪贴板注入（主线程执行）：复制文本 → 目标窗口置前台 →
+    """剪贴板注入（已退役，保留仅作后备参考；现由 _fallback_inject 统一接管）。
+    原实现：复制文本 → 目标窗口置前台 →
     优先 SendInput(Ctrl+V)（Chromium/Electron 信任的键盘输入路径），
     失败再 SendMessage(WM_PASTE) 到焦点控件，最后 PostMessage 兜底。
     每一步都记录 GetLastError，便于定位「返回 0 但文本不入框」的根因。
@@ -1226,6 +1365,95 @@ def _inject_paste(text, target_hwnd):
         return False
 
 
+def _paste_via_ctrlv(text, target_hwnd):
+    """剪贴板注入：复制文本 → 目标窗口置前台 → SendInput(Ctrl+V)。
+    SendInput 是系统级键盘输入，与手动 Ctrl+V 等效，对 Word/浏览器地址栏/
+    Electron 等现代控件最可靠。成功（事件全部发送）即返回 True。
+    注入后尽力恢复用户原剪贴板内容。"""
+    if not text:
+        return False
+    import pyperclip
+    old = None
+    try:
+        old = pyperclip.paste()
+    except Exception:
+        old = None
+    try:
+        pyperclip.copy(text)
+    except Exception as e:
+        logger.error("_paste_via_ctrlv: 剪贴板写入失败: %s", e)
+        return False
+    logger.info("_paste_via_ctrlv: 剪贴板已写入 %d 字符", len(text))
+    try:
+        if target_hwnd:
+            restore_focus(target_hwnd)
+            time.sleep(0.1)
+        if send_ctrl_v(target_hwnd):
+            time.sleep(0.15)
+            logger.info("_paste_via_ctrlv: Ctrl+V 注入成功")
+            return True
+        logger.warning("_paste_via_ctrlv: SendInput Ctrl+V 未全部发出，继续兜底")
+        return False
+    finally:
+        try:
+            if old is not None:
+                pyperclip.copy(old)
+        except Exception:
+            pass
+
+
+def _paste_via_message(text, target_hwnd):
+    """WM_PASTE 直接投递到目标窗口的焦点控件（同步 SendMessage 优先，
+    异步 PostMessage 兜底）。仅对响应 WM_PASTE 消息的控件有效。
+    返回 True 表示事件已送达（尽力而为，不作读回强验证）。"""
+    if not text:
+        return False
+    import pyperclip
+    old = None
+    try:
+        old = pyperclip.paste()
+    except Exception:
+        old = None
+    try:
+        pyperclip.copy(text)
+    except Exception as e:
+        logger.error("_paste_via_message: 剪贴板写入失败: %s", e)
+        return False
+    try:
+        focus_tgt = int(target_hwnd)
+        try:
+            pid = wt.DWORD()
+            tid = user32.GetWindowThreadProcessId(int(target_hwnd), ctypes.byref(pid))
+            info = GUITHREADINFO()
+            info.cbSize = ctypes.sizeof(GUITHREADINFO)
+            if user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+                if int(info.hwndFocus or 0):
+                    focus_tgt = int(info.hwndFocus)
+                elif int(info.hwndCaret or 0):
+                    focus_tgt = int(info.hwndCaret)
+        except Exception as e:
+            logger.warning("_paste_via_message: 解析焦点控件失败: %s", e)
+        r = user32.SendMessageW(focus_tgt, WM_PASTE, 0, 0)
+        err = kernel32.GetLastError()
+        time.sleep(0.15)
+        if int(r) != 0 and err != 5:
+            logger.info("_paste_via_message: WM_PASTE SendMessage 成功 focus_tgt=%s", focus_tgt)
+            return True
+        pr = user32.PostMessageW(focus_tgt, WM_PASTE, 0, 0)
+        err2 = kernel32.GetLastError()
+        time.sleep(0.2)
+        ok = bool(pr) and err2 != 5
+        logger.info("_paste_via_message: WM_PASTE SendMessage 返回=%s err=%s PostMessage=%s err=%s ok=%s",
+                    r, err, pr, err2, ok)
+        return ok
+    finally:
+        try:
+            if old is not None:
+                pyperclip.copy(old)
+        except Exception:
+            pass
+
+
 # ---------- UI Automation 文本注入（根治方案） ----------
 # 通过 UI Automation 的 TextPattern.InsertText 把文本插入到「任意支持 UIA 的编辑控件」
 # （Word / WPS / Electron / Chrome / Edge / 浏览器地址栏 / 各类聊天输入框 / 富文本编辑器等），
@@ -1258,7 +1486,17 @@ def _uia_inserttext_vtable_index():
     """从 typelib 推导 IUIAutomationTextRange.InsertText 的真实 vtable 槽位。
 
     标准 Windows 的 typelib 含 InsertText；本机精简版可能缺失，此时回退到
-    微软标准固定布局 oVft=168（槽位 21，紧随 GetChildren(160) 之后）。"""
+    微软标准固定布局。注意：IUIAutomationTextRange 的标准 vtable 布局为
+    IUnknown(0-2) → Clone(3) → Compare(4) → CompareEndpoints(5) →
+    ExpandToEnclosingUnit(6) → FindAttribute(7) → FindText(8) →
+    GetAttributeValue(9) → GetBoundingRectangles(10) → GetChildren(11) →
+    GetEnclosingElement(12) → GetText(13) → Move(14) → MoveEndpointByUnit(15) →
+    MoveEndpointByRange(16) → Select(17) → AddToSelection(18) →
+    RemoveFromSelection(19) → ScrollIntoView(20) → GetCaretRange(21) →
+    GetSelection(22) → InsertText(23)。
+    ⚠️ 历史坑：旧代码把兜底槽位写成 21（oVft=168），实际指向 GetCaretRange，
+    在精简 typelib 机器上调用 GetCaretRange 返回 S_OK，造成 InsertText「假成功」
+    ——文本未插入却被判定成功，正是「Word/浏览器不落字、只在记事本落字」的根因之一。"""
     global _UITEXT_IDX
     if _UITEXT_IDX is not None:
         return _UITEXT_IDX
@@ -1278,11 +1516,10 @@ def _uia_inserttext_vtable_index():
                     return _UITEXT_IDX
     except Exception as e:
         logger.debug("推导 InsertText vtable 槽位失败（本机 typelib 可能精简）: %s", e)
-    # 精简 typelib 兜底：标准 Windows 的 IUIAutomationTextRange.InsertText 固定位于
-    # oVft=168（槽位 21），紧随 GetChildren(160) 之后。精简系统镜像的 typelib 不描述
-    # 该方法，但运行时接口 vtable 布局仍是微软标准顺序，因此固定槽位依然有效。
-    _UITEXT_IDX = 21
-    logger.debug("UIA InsertText 使用标准固定槽位=21 (oVft=168, 精简 typelib 兜底)")
+    # 精简 typelib 兜底：标准 Windows 8+ 的 IUIAutomationTextRange.InsertText
+    # 固定位于槽位 23（oVft=184），紧随 GetSelection(槽位22) 之后。
+    _UITEXT_IDX = 23
+    logger.debug("UIA InsertText 使用标准固定槽位=23 (oVft=184, 精简 typelib 兜底)")
     return _UITEXT_IDX
 
 
@@ -1300,10 +1537,12 @@ def _uia_pattern_of(element):
 
 def _uia_find_text_pattern(automation, element):
     """在 element 自身 / 后代 / 祖先中查找支持 TextPattern 的控件，返回
-    IUIAutomationTextPattern COM 指针；找不到返回 None。"""
+    (IUIAutomationTextPattern COM 指针, 控件 element)；找不到返回 (None, None)。
+    返回控件 element 是为了让调用方在 TextPattern 拿不到 Range 时，能从
+    同一个控件上转取 ValuePattern 做后备注入。"""
     pat = _uia_pattern_of(element)
     if pat:
-        return pat
+        return pat, element
     # 后代（RawViewWalker 深度优先，带访问去重与上限，防环）
     try:
         import ctypes
@@ -1323,7 +1562,7 @@ def _uia_find_text_pattern(automation, element):
                 pass
             pat = _uia_pattern_of(cur)
             if pat:
-                return pat
+                return pat, cur
             try:
                 child = walker.GetFirstChildElement(cur)
                 sib = child
@@ -1341,22 +1580,26 @@ def _uia_find_text_pattern(automation, element):
         while parent and depth < 16:
             pat = _uia_pattern_of(parent)
             if pat:
-                return pat
+                return pat, parent
             parent = parent.GetParentElement()
             depth += 1
     except Exception:
         pass
-    return None
+    return None, None
 
 
 def _uia_insert_range(text_pattern):
-    """返回用于插入的 TextRange：优先光标处（GetCaretRange / GetSelection 退化 range），
-    失败退回 DocumentRange（文档开头，兜底）。"""
+    """返回用于插入的 TextRange：仅光标处（GetCaretRange / GetSelection 退化 range）。
+
+    ⚠️ 不再退回 DocumentRange：它代表「整个文档」，InsertText 会插到文档开头，
+    不是用户期望的光标位置（用户实测：本想插入文字中间，结果落到别处）。
+    拿不到光标 Range 时返回 None，由调用方转 ValuePattern 或键盘兜底。
+    所有返回值均校验 COM 指针有效性，防精简 typelib provider 返回坏指针。"""
     # 1) GetCaretRange（较新 typelib 位于 IUIAutomationTextPattern）
     try:
         res = text_pattern.GetCaretRange()
         rng = res[1] if isinstance(res, tuple) else res
-        if rng:
+        if _uia_ptr_valid(rng):
             return rng
     except Exception:
         pass
@@ -1364,45 +1607,165 @@ def _uia_insert_range(text_pattern):
     try:
         arr = text_pattern.GetSelection()
         if arr and getattr(arr, "Length", 0) and arr.Length > 0:
-            return arr.GetElement(0)
+            rng = arr.GetElement(0)
+            if _uia_ptr_valid(rng):
+                return rng
     except Exception:
         pass
-    # 3) DocumentRange 兜底
+    return None
+
+
+def _uia_ptr_valid(ptr):
+    """校验 COM 接口指针有效性：非空、vtable 指针可读、不是无效值。
+
+    精简 typelib 的 provider 可能返回坏指针（如 GetCaretRange 返回 BOOL 而非
+    range），直接解引用会 access violation **导致整个进程崩溃**（ctypes 不捕获
+    SEH）。因此用 IsBadReadPtr 先探测可读性，绝不在未经验证的地址上解引用。"""
     try:
-        return text_pattern.DocumentRange
+        if not ptr:
+            return False
+        p = ctypes.cast(ptr, ctypes.c_void_p).value
+        if not p:
+            return False
+        kernel32 = ctypes.windll.kernel32
+        kernel32.IsBadReadPtr.restype = ctypes.c_int
+        kernel32.IsBadReadPtr.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        # 前 16 字节可读（含 vtable 指针）
+        if kernel32.IsBadReadPtr(p, 16):
+            return False
+        vt = ctypes.cast(p, ctypes.POINTER(ctypes.c_void_p))[0]
+        if not vt or int(vt) == -1:
+            return False
+        # vtable 前 64 字节可读（接口方法区，含 InsertText 所在槽位）
+        if kernel32.IsBadReadPtr(vt, 64):
+            return False
+        return True
     except Exception:
-        return None
+        return False
 
 
 def _uia_do_insert(range_ptr, text):
-    """调用 IUIAutomationTextRange.InsertText(text)。优先 comtypes 高层；
-    若本机 typelib 未暴露 InsertText 方法，退回运行时推导的 vtable 槽位做原生调用。"""
-    # 1) comtypes 高层（标准 Windows 可用）
+    """调用 IUIAutomationTextRange.InsertText(text)。
+
+    主路径：comtypes 高层（标准 Windows typelib 可用）。
+    后备：本机精简 typelib 缺失 InsertText 方法时，走 vtable 槽位调用——
+    但必须在 _uia_ptr_valid 校验（IsBadReadPtr）通过后才碰 vtable，
+    并逐一检查槽位函数指针有效性，杜绝 access violation 崩溃
+    （此前崩溃的根因是无校验地解引用 provider 返回的坏指针）。"""
+    if not _uia_ptr_valid(range_ptr):
+        logger.debug("UIA InsertText 跳过：Range 指针无效（精简 typelib provider）")
+        return False
     try:
         range_ptr.InsertText(text)
         return True
     except AttributeError:
-        pass  # 本机 typelib 未生成 InsertText 方法，走 vtable 兜底
-    # 2) 运行时推导的 vtable 槽位
-    import ctypes
-    idx = _uia_inserttext_vtable_index()
-    if not idx:
+        pass  # 本机 typelib 未生成 InsertText 方法（精简）→ 走 vtable（已校验）
+    except Exception as e:
+        logger.debug("UIA comtypes InsertText 调用失败: %s", e)
         return False
+    # vtable 槽位调用（指针已通过 IsBadReadPtr 校验）
+    import ctypes
     try:
+        idx = _uia_inserttext_vtable_index()
+        if not idx:
+            return False
         VTBL = ctypes.POINTER(ctypes.c_void_p)
         pp = ctypes.cast(range_ptr, VTBL)
-        vtable = ctypes.cast(pp[0], VTBL)
-        this = ctypes.cast(range_ptr, ctypes.c_void_p).value
-        fn = ctypes.cast(vtable[idx], ctypes.WINFUNCTYPE(
+        vt = pp[0]
+        fn_ptr = ctypes.cast(vt, VTBL)[idx]
+        if not fn_ptr or int(fn_ptr) == -1:
+            logger.debug("UIA vtable 槽位 %s 无效（provider 未实现 InsertText），放弃", idx)
+            return False
+        fn = ctypes.cast(fn_ptr, ctypes.WINFUNCTYPE(
             ctypes.HRESULT, ctypes.c_void_p, ctypes.c_void_p))
+        this = ctypes.cast(range_ptr, ctypes.c_void_p).value
         oleaut32 = ctypes.windll.oleaut32
         oleaut32.SysAllocString.argtypes = [ctypes.c_wchar_p]
         oleaut32.SysAllocString.restype = ctypes.c_void_p
         bstr = oleaut32.SysAllocString(text)
         hr = fn(this, ctypes.c_void_p(bstr))
+        logger.debug("UIA vtable InsertText hr=0x%08X", hr & 0xFFFFFFFF)
         return (hr & 0xFFFFFFFF) == 0
     except Exception as e:
-        logger.debug("UIA 原生 vtable InsertText 失败: %s", e)
+        logger.debug("UIA vtable InsertText 失败: %s", e)
+        return False
+
+
+def _uia_set_value(element, text):
+    """ValuePattern(10002) 后备注入：对输入框类控件直接设值。
+
+    仅对可写控件（CurrentIsReadOnly=False）注入；**已有内容时追加到末尾
+    （绝不清空原文）**——用户实测替换会删掉原有文字（记事本/文件/WorkBuddy
+    全中招），不可接受；ValuePattern 无法定位光标，追加是保留原文的折中。"""
+    if not text:
+        return False
+    mod = _uia_get_module()
+    try:
+        p = element.GetCurrentPattern(10002)
+        if not p:
+            logger.info("_uia_set_value: 目标控件不支持 ValuePattern")
+            return False
+        vp = p.QueryInterface(mod.IUIAutomationValuePattern)
+        try:
+            if vp.CurrentIsReadOnly:
+                logger.info("_uia_set_value: 控件只读，拒绝注入")
+                return False
+        except Exception:
+            pass
+        try:
+            old = vp.CurrentValue or ""
+        except Exception:
+            old = ""
+        if old:
+            logger.warning("_uia_set_value: 输入框已有内容(%d字)，追加到末尾（不清空原文）",
+                           len(old))
+            vp.SetValue(old + text)
+            logger.info("_uia_set_value: ValuePattern 追加成功（%d 字）", len(text))
+            return True
+        vp.SetValue(text)
+        logger.info("_uia_set_value: ValuePattern 注入成功（%d 字）", len(text))
+        return True
+    except Exception as e:
+        logger.debug("_uia_set_value: ValuePattern 注入失败: %s", e)
+        return False
+
+
+def _inject_wmchar_electron(text, target_hwnd):
+    """Electron/CEF 目标专用：PostMessage(WM_CHAR) 逐字符投递。
+
+    背景：用户环境装有 360 安全卫士，其键盘防护拦截 SendInput/keybd_event
+    （所有目标 LastError=0），但 **不拦截 WM_CHAR 消息投递**——v1 时代实测
+    WorkBuddy（Electron）WM_CHAR 落字成功（当时的"重复落字"正是 WM_CHAR
+    生效 + WM_PASTE 叠加造成的）。
+
+    规则（吸取 v1 教训）：
+    * 仅对窗口类名 Chrome_Widget_Win_1（Electron/CEF）的目标启用；
+    * 投递到光标控件（hwndCaret）或顶层窗口（Electron 会路由到聚焦输入框）；
+    * 投递即视为成功，**不再读回验证、不再叠加 WM_PASTE**（杜绝重复）。
+    """
+    if not text or not target_hwnd:
+        return False
+    try:
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(int(target_hwnd), cls, 64)
+        # Electron/CEF 窗口类名：Chrome_WidgetWin_1（注意不是 Widget_Win）
+        if cls.value not in ("Chrome_WidgetWin_1", "CefBrowserWindow"):
+            return False
+        pid = wt.DWORD()
+        tid = user32.GetWindowThreadProcessId(int(target_hwnd), ctypes.byref(pid))
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        tgt = int(target_hwnd)
+        if user32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndCaret:
+            tgt = int(info.hwndCaret)
+        for ch in text:
+            user32.PostMessageW(tgt, WM_CHAR, ord(ch), 0)
+            time.sleep(0.01)
+        logger.info("wmchar_electron: 已投递 %d 字符到 Electron 目标 (tgt=%s)",
+                    len(text), tgt)
+        return True
+    except Exception as e:
+        logger.debug("wmchar_electron 异常: %s", e)
         return False
 
 
@@ -1432,47 +1795,336 @@ def _inject_uia(text, target_hwnd):
         except Exception:
             pass
 
-        # 取目标元素：优先 ElementFromHandle(target_hwnd)（不依赖前台焦点）
+        # 取目标元素。策略：GetFocusedElement 优先——焦点通常就在目标输入框上
+        # （on_press 已把焦点还给目标窗口），直接命中输入框元素，免去在巨大 UIA
+        # 树里遍历（浏览器/Word 树可达数万节点，4000 上限经常找不到输入框）。
+        # ElementFromHandle(顶层窗口) 仅作后备。
         element = None
-        if target_hwnd:
+        element_from_focus = False
+        try:
+            element = automation.GetFocusedElement()
+            if element:
+                element_from_focus = True
+                logger.debug("UIA 取到焦点元素")
+        except Exception as e:
+            logger.debug("GetFocusedElement 失败: %s", e)
+        if not element and target_hwnd:
             try:
                 element = automation.ElementFromHandle(int(target_hwnd))
+                logger.debug("UIA 取到目标窗口元素 (ElementFromHandle)")
             except Exception as e:
                 logger.debug("ElementFromHandle 失败: %s", e)
         if not element:
-            try:
-                element = automation.GetFocusedElement()
-            except Exception as e:
-                logger.debug("GetFocusedElement 失败: %s", e)
-        if not element:
             logger.info("_inject_uia: 未取得目标元素，回退原有链路")
             return False
+        # ⚠️ 焦点元素若是不可编辑控件（静态文本/只读/禁用），拒绝注入——
+        # 防止语音文本被插进系统提示等不可修改文本（用户实测反馈）。
+        # 仅对焦点元素做类型过滤；ElementFromHandle 顶层元素仍继续遍历后代。
+        if element_from_focus:
+            try:
+                if not element.CurrentIsEnabled:
+                    logger.info("_inject_uia: 焦点元素禁用，拒绝注入")
+                    return False
+                ct = int(element.CurrentControlType)
+                if ct not in (50004, 50030, 50003, 50034):  # Edit/Document/ComboBox/Spinner
+                    logger.info("_inject_uia: 焦点元素类型 %s 不可编辑，拒绝注入", ct)
+                    return False
+            except Exception:
+                pass
 
-        text_pattern = _uia_find_text_pattern(automation, element)
-        if not text_pattern:
-            logger.info("_inject_uia: 目标不支持 TextPattern，回退原有链路")
-            return False
-
-        rng = _uia_insert_range(text_pattern)
-        if not rng:
-            logger.info("_inject_uia: 未取得插入 Range，回退原有链路")
-            return False
-
-        ok = _uia_do_insert(rng, text)
+        text_pattern, ctrl_element = _uia_find_text_pattern(automation, element)
+        rng = _uia_insert_range(text_pattern) if text_pattern else None
+        if rng:
+            ok = _uia_do_insert(rng, text)
+            if ok:
+                logger.info("_inject_uia: UIA TextPattern 注入成功（%d 字）", len(text))
+            else:
+                # InsertText 失败（精简 typelib 无此方法 / 目标不支持）→
+                # 从同一控件转 ValuePattern 后备，再失败才回退键盘链
+                logger.info("_inject_uia: TextPattern 注入失败，尝试 ValuePattern 后备")
+                ok = _uia_set_value(ctrl_element, text) if ctrl_element is not None else False
+                if not ok:
+                    logger.warning("_inject_uia: ValuePattern 后备也失败，回退原有链路")
+        elif ctrl_element is not None:
+            # TextPattern 存在但拿不到有效 Range（Electron/浏览器输入框常见），
+            # 或控件只有 ValuePattern —— 用 ValuePattern 后备注入
+            logger.info("_inject_uia: TextPattern 无可用 Range，尝试 ValuePattern 后备")
+            ok = _uia_set_value(ctrl_element, text)
+        else:
+            logger.info("_inject_uia: 目标不支持 TextPattern/ValuePattern，回退原有链路")
+            ok = False
         if ok:
-            logger.info("_inject_uia: UIA 注入成功（%d 字）", len(text))
             # 注入后尽量把目标窗口提到前台，方便用户继续输入
             try:
                 if target_hwnd:
                     restore_focus(target_hwnd)
             except Exception:
                 pass
-        else:
-            logger.warning("_inject_uia: UIA 注入调用失败，回退原有链路")
         return ok
     except Exception as e:
         logger.exception("_inject_uia 异常: %s", e)
         return False
+
+
+def _inject_word_com(text, target_hwnd):
+    """Word/WPS 文档区专用：COM 自动化 Selection.TypeText 在光标处插入文本。
+
+    适用场景：UIA TextPattern 的 InsertText 在本机精简 typelib 下不可用（comtypes
+    无此方法），ValuePattern 对 Word 文档区又不支持——COM 自动化是 Word 文档区
+    最可靠的注入方式。仅当目标窗口是 Word/WPS/Excel 时才尝试。"""
+    if not text or not target_hwnd:
+        return False
+    try:
+        # 确认目标是 Word/WPS/Excel 窗口（类名识别），避免误触发
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(int(target_hwnd), cls, 64)
+        cname = cls.value
+        is_word = (cname.startswith("OpusApp") or cname.startswith("wps")
+                   or cname.startswith("WPS") or cname == "XLMAIN")
+        if not is_word:
+            return False
+        import comtypes.client
+        app = comtypes.client.GetActiveObject("Word.Application")
+        app.Selection.TypeText(text)
+        logger.info("_inject_word_com: Word COM 注入成功（%d 字, 类名=%s）", len(text), cname)
+        return True
+    except Exception as e:
+        logger.debug("_inject_word_com: 失败（可能无 Word 实例/不是 Word）: %s", e)
+        return False
+
+
+# 可注入的 UIA 控件类型（白名单）：编辑框 / 文档区 / 组合框 / 数值框。
+# 静态文本(TextControl)、图片、按钮等一律不注入——防止越权插入只读/系统提示文本
+# （用户实测：语音文本被插进了 WorkBuddy 对话框的不可修改提示文本）。
+_UIACTRL_EDITABLE_TYPES = ("EditControl", "DocumentControl", "ComboBoxControl",
+                           "SpinnerControl")
+
+
+def _uiauto_editable(ctl):
+    """uiautomation 控件是否「可编辑、可注入」：启用中 + 可编辑类型 + 非只读。
+
+    只读判定双通道：ValuePattern.IsReadOnly + LegacyIAccessible.State 的
+    STATE_SYSTEM_READONLY(0x40)——某些控件 provider 报 ValuePattern 可写，
+    但 LegacyIAccessible 标记只读（如 WorkBuddy 系统提示文本），任一命中即拒绝。"""
+    try:
+        if not getattr(ctl, "IsEnabled", True):
+            return False
+        ctype = getattr(ctl, "ControlTypeName", "") or ""
+        if ctype not in _UIACTRL_EDITABLE_TYPES:
+            return False
+        try:
+            vp = ctl.GetValuePattern()
+            if vp is not None and getattr(vp, "IsReadOnly", False):
+                return False
+        except Exception:
+            pass
+        # LegacyIAccessible 只读状态（STATE_SYSTEM_READONLY = 0x40）
+        try:
+            la = ctl.GetLegacyIAccessiblePattern()
+            if la is not None:
+                st = getattr(la, "State", 0) or 0
+                if st & 0x40:
+                    return False
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _uiauto_focus_in_window(focus_ctl, target_hwnd):
+    """焦点控件是否属于目标窗口（顶层窗口句柄或进程 PID 对比）。
+    防止焦点在别的窗口时误注入错误目标（实测事故：测试文本写进用户
+    正在看的记事本）。"""
+    try:
+        if not target_hwnd:
+            return False
+        tl = focus_ctl.GetTopLevelControl()
+        if tl is not None:
+            if (tl.NativeWindowHandle or 0) == int(target_hwnd):
+                return True
+        # PID 对比兜底（Electron 窗口句柄可能漂移）
+        pid_tgt = ctypes.c_ulong()
+        pid_cur = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(int(target_hwnd), ctypes.byref(pid_tgt))
+        if tl is not None:
+            user32.GetWindowThreadProcessId(tl.NativeWindowHandle or 0, ctypes.byref(pid_cur))
+            return pid_cur.value == pid_tgt.value
+        return False
+    except Exception:
+        return False
+
+
+def _inject_uia_uiauto(text, target_hwnd):
+    """uiautomation 库实现的 UIA 注入（纯 ctypes，不依赖 typelib）。
+
+    本机 comtypes 生成的 UIA 接口（依赖 UIAutomationCore.dll 的 typelib）与实际
+    vtable 布局错位：调用 InsertText/ValuePattern.SetValue 会 access violation
+    （实测 0xFFFFFFFFFFFFFFFF）。uiautomation 库用 ctypes 手写标准接口定义，
+    不经过 typelib，实测可正常注入（记事本 ValuePattern 读回验证通过）。
+
+    安全与位置约束（用户实测反馈修正）：
+    * 只注入「可编辑」控件（启用 + Edit/Document/ComboBox 类型 + 非只读），
+      静态文本/系统提示文本绝不动；
+    * 插入位置只认「光标处」（GetCaretRange / GetSelection 退化 Range），
+      不用 DocumentRange（会插到文档开头）；
+    * ValuePattern 仅作最后手段：输入框为空时直接设值（无位置问题）；
+      已有内容时追加到末尾并告警（该场景应走 TextPattern 光标插入）。
+    返回 True=已注入；False=不可用/失败。"""
+    try:
+        import uiautomation as auto
+    except ImportError:
+        logger.info("uiauto: uiautomation 库不可用")
+        return False
+    try:
+        # 1) 取控件：**焦点控件优先**——用户焦点所在即真实输入框
+        #    （WorkBuddy 实测：32 个空 ComboBox 噪音，ControlFromHandle 遍历
+        #    会选错；焦点控件的 ValuePattern.SetValue 实测有效落字）。
+        #    ⚠️ 必须校验焦点控件**属于目标窗口**（GetTopLevelControl 或 PID 对比），
+        #    否则用户此刻焦点在别的窗口（如正在看的记事本）会误注入（实测事故）。
+        #    ControlFromHandle(目标窗口) 仅作后备。
+        ctrl = None
+        if target_hwnd:
+            try:
+                fc = auto.GetFocusedControl()
+                if fc is not None and _uiauto_focus_in_window(fc, target_hwnd):
+                    ctrl = fc
+                    logger.debug("uiauto: 焦点控件命中（属于目标窗口 %s）", target_hwnd)
+            except Exception as e:
+                logger.debug("uiauto GetFocusedControl 失败: %s", e)
+        if ctrl is None and target_hwnd:
+            try:
+                ctrl = auto.ControlFromHandle(int(target_hwnd))
+                logger.debug("uiauto: 目标窗口控件取得 (ControlFromHandle)")
+            except Exception as e:
+                logger.debug("uiauto ControlFromHandle 失败: %s", e)
+        if ctrl is None:
+            try:
+                ctrl = auto.GetFocusedControl()
+                logger.debug("uiauto: 最终回退焦点控件")
+            except Exception as e:
+                logger.debug("uiauto GetFocusedControl 兜底失败: %s", e)
+        if ctrl is None:
+            logger.info("uiauto: 未取得控件")
+            return False
+
+        # 2) 收集自身/后代中所有「可编辑」候选控件（深度放宽到 20——
+        #    WorkBuddy 真实输入框在深度 15 的 ComboBox，浅遍历会漏掉；
+        #    提示文本区通常只读会被 _uiauto_editable 过滤）
+        candidates = []
+
+        def collect_inject_ctls(ctl, depth=0):
+            if depth > 20 or len(candidates) > 20:
+                return
+            try:
+                if _uiauto_editable(ctl):
+                    candidates.append(ctl)
+                    return  # 该控件自身可注入，不再深入其子树
+            except Exception:
+                pass
+            try:
+                for ch in ctl.GetChildren():
+                    collect_inject_ctls(ch, depth + 1)
+            except Exception:
+                pass
+
+        collect_inject_ctls(ctrl)
+        if not candidates:
+            logger.info("uiauto: 未找到可编辑控件（只读/静态文本不注入）")
+            return False
+
+        # 选择最优候选：空 Value（真输入框特征）优先，内容越长越像提示区越靠后
+        def _uiauto_score(c):
+            s = 0
+            try:
+                vp = c.GetValuePattern()
+                if vp:
+                    v = vp.Value or ""
+                    if not v:
+                        s += 100
+                    else:
+                        s -= len(v)
+                if getattr(c, "IsKeyboardFocusable", False):
+                    s += 10
+            except Exception:
+                pass
+            return s
+
+        inj_ctl = max(candidates, key=_uiauto_score)
+        _vp0 = None
+        try:
+            _vp0 = inj_ctl.GetValuePattern()
+        except Exception:
+            _vp0 = None
+        _vlen0 = len(_vp0.Value or "") if _vp0 is not None else -1
+        logger.info("uiauto: 目标控件 %s 类型=%s ValueLen=%s",
+                    inj_ctl.Name or "?", inj_ctl.ControlTypeName, _vlen0)
+        # 3) ValuePattern 注入（uiautomation 库未封装 TextPattern.InsertText，
+        #    唯一可靠通道是 ValuePattern.SetValue）：
+        #    * 空输入框 → 直接设值
+        #    * 已有内容 → **追加到末尾（绝不清空原文）**——用户实测替换会删掉
+        #      原有文字（记事本/文件/WorkBuddy 全部中招），不可接受；追加保留
+        #      原文，仅位置在末尾（日志注明）。
+        #    * 只读控件 → 拒绝
+        try:
+            vp = inj_ctl.GetValuePattern()
+            if vp:
+                if getattr(vp, "IsReadOnly", False):
+                    logger.info("uiauto: 控件只读(ValuePattern IsReadOnly)，拒绝注入")
+                    return False
+                try:
+                    old = vp.Value or ""
+                except Exception:
+                    old = ""
+                if old:
+                    logger.warning("uiauto: 输入框已有内容(%d字)，追加到末尾（不清空原文）",
+                                   len(old))
+                    vp.SetValue(old + text)
+                    logger.info("uiauto: ValuePattern 追加成功（%d 字）", len(text))
+                    return True
+                vp.SetValue(text)
+                logger.info("uiauto: ValuePattern 注入成功（%d 字）", len(text))
+                return True
+        except Exception as e:
+            logger.debug("uiauto ValuePattern 注入失败: %s", e)
+        return False
+    except Exception as e:
+        logger.debug("_inject_uia_uiauto 异常: %s", e)
+        return False
+
+
+def _fallback_inject(text, target_hwnd):
+    """UIA 失败后的兜底注入链（v14：恢复 v2 的完整链路 + 修复版 post_text）：
+    SendInput Unicode → 剪贴板 Ctrl+V → WM_CHAR(修复版读回验证) → WM_PASTE。
+
+    v14 说明：用户实测 v2 行为最好，唯一问题是电子表格重复落字。v2 的重复
+    根因是 post_text 的读回验证在「空文本」场景失效（_get_window_text 空返回
+    None → 误判未落字 → 继续 WM_PASTE → 双份）。本版 post_text 已修复：
+    空文本返回 "" + 无光标控件跳过 + 读回确认才成功 → Excel 单次落字。
+    经典控件（记事本/Excel）走 WM_CHAR 通道即可单次成功；现代控件（Electron
+    等）由 WM_PASTE 兜底。"""
+    # 先把目标窗口置前台并恢复可编辑子控件焦点（SendInput 只投递给前台窗口）
+    restore_focus(target_hwnd)
+    time.sleep(0.1)
+    # 1) SendInput KEYEVENTF_UNICODE：真实键盘输入，不经剪贴板/IME。
+    if type_unicode(text, target_hwnd):
+        logger.info("_fallback_inject: SendInput Unicode 注入成功（%d 字）", len(text))
+        return True
+    logger.warning("_fallback_inject: SendInput Unicode 未全部发出，继续兜底")
+    # 2) 剪贴板 + SendInput Ctrl+V：与手动粘贴等效。
+    if _paste_via_ctrlv(text, target_hwnd):
+        logger.info("_fallback_inject: 剪贴板 Ctrl+V 注入成功")
+        return True
+    # 3) WM_CHAR 直投（修复版：空文本可读回验证 + 无光标跳过；读回确认才成功，
+    #    避免「已生效却误判失败 → 再走 WM_PASTE」的重复落字）
+    if post_text(target_hwnd, text):
+        logger.info("_fallback_inject: WM_CHAR 注入成功（读回验证通过）")
+        return True
+    # 4) WM_PASTE 直投（单次注入兜底）
+    if _paste_via_message(text, target_hwnd):
+        logger.info("_fallback_inject: WM_PASTE 注入成功")
+        return True
+    logger.error("_fallback_inject: 全部注入方式失败，文本未能送达：%r", text[:40])
 
 
 def inject_text(text, mode="type", target_hwnd=None):
@@ -1483,46 +2135,33 @@ def inject_text(text, mode="type", target_hwnd=None):
     if mode == "kb":
         # 语音速记：先落盘当日速记，再照常填入光标
         append_to_kb(text, os.environ.get("VI_KB_DIR"))
-    # 【根治方案】优先尝试 UIA TextPattern 注入：对 Word / WPS / Electron / 浏览器 /
-    # 聊天输入框等现代控件最稳（不依赖 SendInput / 剪贴板 / 前台焦点）。
-    # 不支持 TextPattern 的控件（如经典 EDIT=记事本）或 UIA 不可用时返回 False，
-    # 自动回退到下方原有 SendInput / 剪贴板 / WM_PASTE 链路。
+    # 【v14：恢复 v2 的注入结构】优先 UIA（comtypes 版）；失败后进入多级兜底链
+    # （SendInput → 剪贴板 Ctrl+V → WM_CHAR(修复版读回) → WM_PASTE）。
+    # 注：v2 行为经用户实测最佳；Excel 重复问题由修复版 post_text 解决
+    # （空文本可读回验证 + 无光标跳过 + 读回确认才成功）。
     if _inject_uia(text, target_hwnd):
-        logger.info("inject_text: UIA 注入成功，结束（已跳过原有链路）")
+        logger.info("inject_text: UIA 注入成功，结束（已跳过兜底链）")
         return
-    logger.info("inject_text: UIA 不可用/失败，回退原有注入链路")
-    if mode == "clipboard":
-        # 注入流程调度到 tkinter 主线程执行（restore_focus 在主线程调用
-        # SetForegroundWindow 更可靠，且 SendInput 必须由前台线程发出才被系统接受）。
-        # 优先 SendInput(Ctrl+V) 键盘路径，失败再 WM_PASTE，最后 PostMessage 兜底。
-        try:
-            _app = app
-        except NameError:
-            _app = None
-        if _app is not None:
-            done = threading.Event()
+    logger.info("inject_text: UIA 不可用/失败，进入多级兜底链")
+    # 兜底链调度到 tkinter 主线程执行：restore_focus 在主线程调用
+    # SetForegroundWindow 更可靠，且 SendInput 必须由前台线程发出才被系统接受。
+    try:
+        _app = app
+    except NameError:
+        _app = None
+    if _app is not None:
+        done = threading.Event()
 
-            def _run():
-                try:
-                    _inject_paste(text, target_hwnd)
-                finally:
-                    done.set()
+        def _run():
+            try:
+                _fallback_inject(text, target_hwnd)
+            finally:
+                done.set()
 
-            _app.root.after(0, _run)
-            done.wait(timeout=5)
-        else:
-            _inject_paste(text, target_hwnd)
-        return
-    # type 模式：优先用 PostMessage(WM_CHAR) 直接投递到目标窗口/caret，
-    # 前台无关、对 Electron/Web/记事本等各类输入框都最稳（SendInput 对 Electron 常被吞）。
-    # 仅当 PostMessage 失败时，才回退 SendInput（配合前台锁把焦点切回目标）。
-    if post_text(target_hwnd, text):
-        return
-    logger.warning("post_text 失败，回退 SendInput 注入")
-    if restore_focus(target_hwnd):
-        type_unicode(text, target_hwnd)
+        _app.root.after(0, _run)
+        done.wait(timeout=10)
     else:
-        logger.error("两种注入方式均失败，文本未能送达：%r", text[:40])
+        _fallback_inject(text, target_hwnd)
 
 
 # 开头噪音清洗：按住图标瞬间的按键声/说话前气声常被 ASR 误识别成语气词
@@ -1767,6 +2406,23 @@ class FloatingApp:
         self._hover = False
         self._set_hover_state(self._mouse_down_on_icon)
 
+    def _snapshot_target(self):
+        """快照目标输入窗口（鼠标按住浮窗 / 全局热键两条路径共用）。
+        目标 = 你开始说话"之前"正在输入的窗口。
+        优先级：钩子记录的上一个真实前台窗口 > 当前前台(排除本程序浮窗)。
+        ⚠️ 按下浮窗图标那一刻，前台窗口恰恰是这个浮窗自己，绝不能把它当目标
+        （否则文字会送回浮窗自身而消失）。"""
+        lf = last_foreground.get("hwnd", 0)
+        fg = user32.GetForegroundWindow()
+        fg_int = int(fg) if fg else 0
+        if fg_int and not _is_our_window(fg_int):
+            self._target_hwnd = fg_int
+        else:
+            self._target_hwnd = lf or fg_int
+        logger.info("快照目标窗口 hwnd=%s (lf=%s, fg=%s, fg_is_ours=%s)",
+                    self._target_hwnd, lf, fg_int, _is_our_window(fg_int))
+        return self._target_hwnd
+
     def on_press(self, e):
         logger.info("on_press: 按住图标，开始录音")
         # 背景已透明：仅当点击落在圆圈内（圆心=当前尺寸中心，半径 11 按比例）
@@ -1779,19 +2435,7 @@ class FloatingApp:
         self._mouse_down_on_icon = True
         self._set_hover_state(True)
         if not self.recording:
-            # 目标窗口 = 按下浮窗"之前"你正在输入的窗口。
-            # 注意：按下浮窗图标那一刻，前台窗口恰恰是这个浮窗自己，
-            # 绝不能把它当成目标（否则文字会送回浮窗自身而消失）。
-            # 优先级：钩子记录的上一个真实前台窗口 > 当前前台(排除自身)。
-            lf = last_foreground.get("hwnd", 0)
-            fg = user32.GetForegroundWindow()
-            fg_int = int(fg) if fg else 0
-            if fg_int and not _is_our_window(fg_int):
-                self._target_hwnd = fg_int
-            else:
-                self._target_hwnd = lf or fg_int
-            logger.info("on_press: 快照目标窗口 hwnd=%s (lf=%s, fg=%s, fg_is_ours=%s)",
-                        self._target_hwnd, lf, fg_int, _is_our_window(fg_int))
+            self._snapshot_target()
             # 按住瞬间把焦点还给目标窗口，避免后续注入时焦点还在浮窗
             if self._target_hwnd and not _is_our_window(self._target_hwnd):
                 restore_focus(self._target_hwnd)
@@ -2240,6 +2884,10 @@ class FloatingApp:
             self.stop_rec()
 
     def start_rec(self):
+        # 防御：目标窗口缺失时（全局热键路径可能未走 on_press 快照）补一次快照，
+        # 避免注入落到 0/旧目标窗口导致文字丢失
+        if not getattr(self, "_target_hwnd", 0):
+            self._snapshot_target()
         self.recording = True
         self._anim_tick = 0
         self.draw_circle(self.rec_color)
@@ -2412,7 +3060,8 @@ def main():
     mode = os.environ.get("VI_MODE", "clipboard")
     from xfyun_asr import XfyunTranscriber
     transcriber = XfyunTranscriber()
-    logger.info("=== 语音输入法启动 mode=%s engine=xfyun ===", mode)
+    logger.info("=== 语音输入法启动 mode=%s engine=xfyun 完整性=%s ===",
+                mode, _process_integrity_level())
 
     recorder = Recorder()
     global app
@@ -2446,6 +3095,12 @@ def main():
                 if key == keyboard.Key.space and not app.recording:
                     if any(k in hot_pressed for k in _HOT_CTRL) and \
                        any(k in hot_pressed for k in _HOT_ALT):
+                        # 热键路径：按下 Space 时前台正是用户正在输入的目标窗口，
+                        # 立即快照（on_press 只覆盖鼠标按住浮窗路径）
+                        try:
+                            app._snapshot_target()
+                        except Exception:
+                            pass
                         app.root.after(0, app.start_rec)
             except Exception:
                 pass

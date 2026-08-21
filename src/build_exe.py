@@ -61,6 +61,8 @@ cmd = [
     "--hidden-import", "comtypes.client",
     "--hidden-import", "comtypes.typeinfo",
     "--hidden-import", "comtypes.gen",
+    # uiautomation 库：纯 ctypes 实现，不依赖 typelib，本机精简 typelib 下仍可正常注入
+    "--hidden-import", "uiautomation",
     os.path.join(HERE, "voice_input.py"),
 ]
 

@@ -9,3 +9,6 @@ pillow
 websocket-client
 # UI Automation 文本注入（根治「只在记事本落字」：对 Word/Electron/浏览器等现代控件插入文本）
 comtypes==1.4.16
+# 纯 ctypes 实现的 UIA 客户端（不依赖 typelib）——本机精简 typelib 与真实 vtable 错位时，
+# comtypes 调用 UIA 方法会 access violation，uiautomation 库可正常注入
+uiautomation

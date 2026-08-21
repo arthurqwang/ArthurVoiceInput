@@ -9,9 +9,9 @@ Windows 屏幕常驻语音输入法：**按住鼠标说话，松开即识别并�
 
 长按鼠标左键呼出输入按钮，在保持与讯飞输入法同等准确性的前提下，**解决讯飞输入法自带的大块悬浮窗口遮盖文字的问题**。使用起来非常方便迅捷。
 
-基于讯飞开放平台「语音听写 iat」引擎，识别结果通过模拟键盘/剪贴板注入到任意应用——记事本、浏览器、聊天窗口、办公软件均可使用。打包为单文件 exe，无需安装 Python 环境即可运行。
+基于讯飞开放平台「语音听写 iat」引擎，识别结果通过 UIA / 模拟键盘 / 剪贴板多级注入到任意应用——记事本、浏览器、聊天窗口、办公软件均可使用。打包为免安装绿色目录版（onedir），无需安装 Python 环境即可运行。
 
-> **特色**：零学习成本的长按说话交互 · 单文件免安装 · 支持开机自启 · 语音速记模式
+> **特色**：零学习成本的长按说话交互 · 免安装绿色版 · 支持开机自启 · 语音速记模式
 
 > 🔗 **GitHub 仓库**：[arthurqwang/ArthurVoiceInput](https://github.com/arthurqwang/ArthurVoiceInput)
 
@@ -25,7 +25,7 @@ Windows 屏幕常驻语音输入法：**按住鼠标说话，松开即识别并�
 | 🎙️ 讯飞 iat 引擎 | 16kHz 音频 WebSocket 实时听写，中文识别稳定 |
 | ⌨️ 三种注入模式 | `clipboard`（Ctrl+V 粘贴，默认）/ `type`（底层键盘模拟）/ `kb`（语音速记到 markdown 文件） |
 | 🔑 全局热键 | `Ctrl+Alt+Space` 按住也可录音 |
-| 🚀 单文件 exe | PyInstaller 打包，脱离 Python 环境独立运行（约 33MB） |
+| 🚀 免安装绿色版 | PyInstaller onedir 打包，整目录拷贝即可运行，启动零解压（约 73MB） |
 | 🔄 智能重启 | 右键菜单「重启」一键重启，配置改动即时生效 |
 | 🌅 开机自启 | 配置窗口勾选即写注册表；exe 每次启动自检自愈（改名/移动后自动修正） |
 | 📡 代理友好 | 自动读取 `HTTPS_PROXY` / `HTTP_PROXY` 走代理（适配内网） |
@@ -36,8 +36,8 @@ Windows 屏幕常驻语音输入法：**按住鼠标说话，松开即识别并�
 
 ### 方式一：直接使用（推荐）
 
-1. 下载 [Releases](https://github.com/arthurqwang/ArthurVoiceInput/releases) 中的 `ArthurVoiceInput.exe`（64 位 Windows 8.1+）
-2. 双击运行，屏幕出现淡红色麦克风小圆饼
+1. 下载 [Releases](https://github.com/arthurqwang/ArthurVoiceInput/releases) 中的 `ArthurVoiceInput.zip`（64 位 Windows 8.1+，解压即用）
+2. 解压后双击 `ArthurVoiceInput.exe`，屏幕出现淡红色麦克风小圆饼
 3. 首次使用需配置讯飞密钥（见下），**免费额度每日 500 次**
 
 ### 申请讯飞密钥（免费）
@@ -83,11 +83,11 @@ python voice_input.py
 
 > 凭证优先级：环境变量 > `xfyun_config.ini`（格式见 `[xfyun]` 段）
 
-### 打包为单文件 exe
+### 打包为免安装绿色版（onedir）
 
 ```bash
 pip install pyinstaller
-python build_exe.py        # 产物：dist/ArthurVoiceInput.exe
+python build_exe.py        # 产物：dist/ArthurVoiceInput/（整目录即发布版）
 ```
 
 打包完成后会自动同步开机自启动注册表（若已启用），exe 启动时也会自检修正自启动路径。
@@ -98,14 +98,19 @@ python build_exe.py        # 产物：dist/ArthurVoiceInput.exe
 
 ```
 ArthurVoiceInput/
-├── voice_input.py      # 主程序：浮窗 UI / 录音 / 注入 / 菜单 / 自启动
-├── xfyun_asr.py        # 讯飞 iat WebSocket 引擎（鉴权 / 代理 / 重试）
-├── build_exe.py        # PyInstaller 打包脚本
-├── requirements.txt    # Python 依赖
-├── run_xfyun.bat       # 一键启动脚本（读 xfyun_config.ini 凭证）
-├── AVI_logo28.png      # 浮窗 idle 图标 / 窗口图标
-├── AVI_logo.ico        # exe 图标（由 AVI_logo.png 生成）
-└── dist/               # 打包产物（ArthurVoiceInput.exe）
+├── src/                   # 源码
+│   ├── voice_input.py      # 主程序：浮窗 UI / 录音 / 注入 / 菜单 / 自启动
+│   ├── xfyun_asr.py        # 讯飞 iat WebSocket 引擎（鉴权 / 代理 / 重试）
+│   ├── build_exe.py        # PyInstaller 打包脚本（onedir）
+│   ├── requirements.txt    # Python 依赖
+│   ├── run_xfyun.bat       # 一键启动脚本（读 xfyun_config.ini 凭证）
+│   ├── AVI_logo28.png      # 浮窗 idle 图标 / 窗口图标
+│   ├── AVI_logo.ico        # exe 图标（由 AVI_logo.png 生成）
+│   └── dist/               # 打包产物（ArthurVoiceInput/ 整目录）
+├── ArthurVoiceInput/       # 发布版（exe + _internal/，整目录拷贝即用）
+├── xfyun_config.ini.example  # 讯飞凭证配置模板（复制为 xfyun_config.ini 填写）
+├── README.md
+└── LICENSE
 ```
 
 ---
@@ -113,10 +118,13 @@ ArthurVoiceInput/
 ## ❓ 常见问题（FAQ）
 
 **Q：杀毒软件误报？**
-A：单文件 exe 未做代码签名，360/Defender 等可能误报，添加信任即可；面向公众大规模分发可考虑代码签名。
+A：绿色版 exe 未做代码签名，360/Defender 等可能误报，添加信任即可；面向公众大规模分发可考虑代码签名。
 
 **Q：首次启动慢？**
-A：单文件 exe 每次启动需解压到临时目录（约 3~10 秒），属正常；常驻运行后无影响。
+A：onedir 版启动零解压，首次冷启动约 1~3 秒属正常（音频/COM 组件初始化）；常驻运行后无影响。
+
+**Q：某些程序不落字（如 Electron 应用、管理员权限窗口）？**
+A：程序使用多级注入链（UIA → 键盘 → 剪贴板 → WM_PASTE）自动降级，已覆盖记事本/Excel/Word/浏览器/Electron 输入框。若个别高权限窗口仍不落字，请以管理员身份运行本程序。
 
 **Q：识别为空或乱码？**
 A：确认麦克风正常、网络畅通、说话清晰；讯飞对低音量前段易"脑补"乱码，可适当靠近麦克风。
@@ -134,7 +142,7 @@ A：不会。exe 每次启动自动自检，若自启动项未指向当前 exe �
 - **讯飞鉴权**：HMAC-SHA256 生成 `authorization`，WSS 握手（`iat-api.xfyun.cn/v2/iat`）
 - **代理适配**：内网环境手动 CONNECT 建隧道 + 手包 TLS，规避企业代理对 WSS 空闲的秒断
 - **稳定性**：3 次退避重试；普通模式（非 dwa=wpgs）避免短句拼接乱码
-- **注入链路**：KEYEVENTF_UNICODE → Ctrl+V → WM_PASTE → PostMessage 四级降级
+- **注入链路**：UIA（comtypes/uiautomation）→ SendInput Unicode → 剪贴板 Ctrl+V → WM_CHAR（读回验证）→ WM_PASTE 多级降级
 - **浮窗渲染**：`UpdateLayeredWindow` per-pixel alpha 半透明圆饼，录音波形动画
 
 ---
